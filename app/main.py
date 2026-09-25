@@ -756,8 +756,12 @@ def _commit_chunk(
             if placed:
                 final.unlink(missing_ok=True)
             tmp_path.unlink(missing_ok=True)
+            # 失败路径同样释放活动期保护，避免幽灵登记。
+            storage.active_tempfiles.discard(tmp_path)
             raise
 
+    # 成功落位：临时路径已 replace 为正式分片，摘除其活动登记。
+    storage.active_tempfiles.discard(tmp_path)
     return _chunk_accepted_payload(session_id, start, end)
 
 
@@ -913,11 +917,15 @@ def _commit_chunk_repair(
                 final.unlink(missing_ok=True)
                 backup.replace(final)
             tmp_path.unlink(missing_ok=True)
+            # 异常路径释放活动期保护。
+            storage.active_tempfiles.discard(tmp_path)
             raise
 
         # 提交成功后备份才完成使命（旧分片已被新版本取代）。
         backup.unlink(missing_ok=True)
 
+    # 成功落位：临时路径已 replace 为正式分片，摘除其活动登记。
+    storage.active_tempfiles.discard(tmp_path)
     return _chunk_accepted_payload(session_id, start, end)
 
 
@@ -981,50 +989,54 @@ async def repair_chunk(
 
     # 流式接收与逐片摘要计算与普通 PUT 完全相同：失败只清理临时文件，
     # 旧分片与其登记从这一刻起根本还没被触碰。
-    tmp = storage.new_temp_file()
-    received = 0
-    digest = hashlib.sha256() if expected_chunk_digest is not None else None
-    try:
-        with tmp.open("wb") as out:
-            async for block in request.stream():
-                received += len(block)
-                if received > declared_length:
-                    raise _http(
-                        413,
-                        "request body longer than declared range",
-                        declared=declared_length,
-                    )
-                out.write(block)
-                if digest is not None:
-                    digest.update(block)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    #
+    # 临时文件从创建到落位/失败全程在活动登记表内（receive_temp_file）：
+    # 弱网客户端停顿再久，后台清理也不会把正在接收的文件删掉；任何路径
+    # 退出（含客户端断连、提交失败）都由上下文管理器摘除登记。
+    with storage.receive_temp_file() as tmp:
+        received = 0
+        digest = hashlib.sha256() if expected_chunk_digest is not None else None
+        try:
+            with tmp.open("wb") as out:
+                async for block in request.stream():
+                    received += len(block)
+                    if received > declared_length:
+                        raise _http(
+                            413,
+                            "request body longer than declared range",
+                            declared=declared_length,
+                        )
+                    out.write(block)
+                    if digest is not None:
+                        digest.update(block)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
-    if received != end - start:
-        tmp.unlink(missing_ok=True)
-        raise _http(
-            400,
-            "body length does not match declared range",
-            bytes_received=received,
-            expected=end - start,
-        )
-
-    if digest is not None:
-        actual_chunk_digest = digest.hexdigest()
-        if actual_chunk_digest != expected_chunk_digest:
-            # 摘要不符：临时文件删除即可，旧分片、登记与字节数原封不动。
+        if received != end - start:
             tmp.unlink(missing_ok=True)
             raise _http(
-                422,
-                "chunk sha256 mismatch",
-                start=start,
-                end=end,
-                expected=expected_chunk_digest,
-                actual=actual_chunk_digest,
+                400,
+                "body length does not match declared range",
+                bytes_received=received,
+                expected=end - start,
             )
 
-    return await run_sync(_commit_chunk_repair, session_id, start, end, str(tmp))
+        if digest is not None:
+            actual_chunk_digest = digest.hexdigest()
+            if actual_chunk_digest != expected_chunk_digest:
+                # 摘要不符：临时文件删除即可，旧分片、登记与字节数原封不动。
+                tmp.unlink(missing_ok=True)
+                raise _http(
+                    422,
+                    "chunk sha256 mismatch",
+                    start=start,
+                    end=end,
+                    expected=expected_chunk_digest,
+                    actual=actual_chunk_digest,
+                )
+
+        return await run_sync(_commit_chunk_repair, session_id, start, end, str(tmp))
 
 
 @app.put(
@@ -1112,51 +1124,55 @@ async def put_chunk(
     # 流式落临时文件，弱网下也不会把整分片读进内存。
     # 提供 X-Chunk-SHA256 时同步增量计算摘要：校验不过只删除临时文件，
     # 绝不移动到分片目录、绝不登记区间，因此重传正确内容后仍可正常完成。
-    tmp = storage.new_temp_file()
-    received = 0
-    digest = hashlib.sha256() if expected_chunk_digest is not None else None
-    try:
-        with tmp.open("wb") as out:
-            async for block in request.stream():
-                received += len(block)
-                if received > declared_length:
-                    raise _http(
-                        413,
-                        "request body longer than declared range",
-                        declared=declared_length,
-                    )
-                out.write(block)
-                if digest is not None:
-                    digest.update(block)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    #
+    # 临时文件从创建起即受活动期保护（receive_temp_file）：接收期间客户端
+    # 长时间停顿时 mtime 虽老但清理绝不删除（登记与清理共用一把锁，判定
+    # 与删除原子），提交 rename 或任一路径失败都会摘除登记。
+    with storage.receive_temp_file() as tmp:
+        received = 0
+        digest = hashlib.sha256() if expected_chunk_digest is not None else None
+        try:
+            with tmp.open("wb") as out:
+                async for block in request.stream():
+                    received += len(block)
+                    if received > declared_length:
+                        raise _http(
+                            413,
+                            "request body longer than declared range",
+                            declared=declared_length,
+                        )
+                    out.write(block)
+                    if digest is not None:
+                        digest.update(block)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
-    if received != end - start:
-        tmp.unlink(missing_ok=True)
-        raise _http(
-            400,
-            "body length does not match declared range",
-            bytes_received=received,
-            expected=end - start,
-        )
-
-    if digest is not None:
-        actual_chunk_digest = digest.hexdigest()
-        if actual_chunk_digest != expected_chunk_digest:
+        if received != end - start:
             tmp.unlink(missing_ok=True)
             raise _http(
-                422,
-                "chunk sha256 mismatch",
-                start=start,
-                end=end,
-                expected=expected_chunk_digest,
-                actual=actual_chunk_digest,
+                400,
+                "body length does not match declared range",
+                bytes_received=received,
+                expected=end - start,
             )
 
-    return await run_sync(
-        _commit_chunk, session_id, start, end, str(tmp), presented_claim
-    )
+        if digest is not None:
+            actual_chunk_digest = digest.hexdigest()
+            if actual_chunk_digest != expected_chunk_digest:
+                tmp.unlink(missing_ok=True)
+                raise _http(
+                    422,
+                    "chunk sha256 mismatch",
+                    start=start,
+                    end=end,
+                    expected=expected_chunk_digest,
+                    actual=actual_chunk_digest,
+                )
+
+        return await run_sync(
+            _commit_chunk, session_id, start, end, str(tmp), presented_claim
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1458,10 +1474,13 @@ def _copy_chunk(
             # 落位时才删除落地文件，绝不留下已登记/半登记的损坏分片，也
             # 不误删移动前就已存在的同路径分片。
             tmp_path.unlink(missing_ok=True)
+            storage.active_tempfiles.discard(tmp_path)
             if placed:
                 final.unlink(missing_ok=True)
             raise
 
+        # 成功落位：临时路径已 replace 为正式分片，摘除其活动登记。
+        storage.active_tempfiles.discard(tmp_path)
         return _chunk_accepted_payload(target_session_id, target_start, target_end)
 
 
@@ -1519,6 +1538,8 @@ def complete_session(session_id: str) -> dict:
             )
 
         # 拼装 + 整文件 SHA-256。成品先落在 tmp，绝不提前暴露。
+        # 拼装期间临时文件同样受活动期保护：大文件拼装再久也不会被
+        # 后台清理误删；下面每条出口（不匹配/发布失败/发布成功）都摘除登记。
         try:
             tmp_file, digest = storage.assemble_artifact(
                 session_id, intervals, row["total_size"]
@@ -1528,6 +1549,7 @@ def complete_session(session_id: str) -> dict:
 
         if digest != row["sha256_expected"]:
             Path(tmp_file).unlink(missing_ok=True)
+            storage.active_tempfiles.discard(tmp_file)
             raise _http(
                 422,
                 "sha256 mismatch",
@@ -1560,7 +1582,10 @@ def complete_session(session_id: str) -> dict:
         except BaseException:
             storage.artifact_path(session_id).unlink(missing_ok=True)
             Path(tmp_file).unlink(missing_ok=True)
+            storage.active_tempfiles.discard(tmp_file)
             raise
+        # 成品已原子发布：临时路径已 rename 走，摘除其活动登记。
+        storage.active_tempfiles.discard(tmp_file)
 
         # 提交成功后才删除分片，节省磁盘。
         shutil.rmtree(storage.parts_dir(session_id), ignore_errors=True)

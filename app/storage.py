@@ -5,7 +5,11 @@ import hashlib
 import os
 import re
 import shutil
+import stat as stat_module
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -43,6 +47,11 @@ def future_expiry() -> tuple[str, str]:
 #     files/<session_id>                完成后的成品（原子 rename 落地）
 #     parts/<session_id>/<start>-<end>  已收分片
 #     tmp/<随机名>                       正在接收/拼装的临时文件
+#
+# tmp 下的临时文件从创建起即登记到 active_tempfiles：只要登记还在（请求
+# 仍存活，哪怕客户端长时间停顿、mtime 已超过一小时），定时清理就绝不删除；
+# 提交落位或失败清理时在同一把登记锁内摘除。进程退出后登记表随之消失，
+# 遗留文件再由定时清理按 mtime 兜底回收（见 ActiveTempFiles）。
 # ---------------------------------------------------------------------------
 
 def files_dir() -> Path:
@@ -108,10 +117,15 @@ def ensure_dirs() -> None:
 
 
 def new_temp_file() -> Path:
-    """在 tmp 目录下创建一个新的临时文件（已存在、已关闭）。"""
-    fd, name = tempfile.mkstemp(dir=tmp_dir(), prefix="recv-", suffix=".part")
-    os.close(fd)
-    return Path(name)
+    """在 tmp 目录下创建一个新的临时文件并登记活动保护（已存在、已关闭）。
+
+    创建与登记在同一把活动登记锁内完成，因此文件一旦对清理线程可见，
+    就必然处于受保护状态，不存在“先被清理看到、后登记”的窗口。返回路径
+    的所有权归调用方：用完（落位 rename 或失败 unlink）后必须调用
+    :meth:`active_tempfiles.discard <ActiveTempFiles.discard>`
+    （通常经 :func:`receive_temp_file` 上下文管理器自动完成）。
+    """
+    return active_tempfiles.create()
 
 
 def remove_session_tree(session_id: str) -> None:
@@ -124,18 +138,113 @@ def remove_session_tree(session_id: str) -> None:
         pass
 
 
-def sweep_old_tempfiles(older_than: datetime) -> None:
-    """删除早于给定时间的临时文件（崩溃残留）。"""
-    for entry in tmp_dir().glob("*"):
-        try:
-            mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
-        except FileNotFoundError:
-            continue
-        if mtime < older_than and entry.is_file():
-            try:
-                entry.unlink()
-            except FileNotFoundError:
-                pass
+class ActiveTempFiles:
+    """tmp 接收文件的进程内活动登记表。
+
+    背景：PUT 分片与原位修复都先在 tmp 流式落接收文件，弱网客户端可能
+    长时间停顿——仅按 mtime（一小时前）清理会把**仍在接收**的文件 unlink，
+    随后提交落位必然失败。登记表是权威的“活动期”判据：
+
+    * ``create`` 在同一把锁内创建文件并登记：登记期间（请求全程存活，
+      哪怕停顿超过一小时）文件一律受保护，清理跳过；
+    * ``sweep`` 与登记共用这把锁，先在锁内判定再删除，判定与删除原子，
+      不会出现“刚判为闲置、马上被新请求使用”的 TOCTOU；
+    * 提交落位/失败清理后在同一把锁内 ``discard``，异常路径由
+      :func:`receive_temp_file` 的 finally 兜底摘除；
+    * 登记表仅存在于进程内存：进程退出后遗留文件不再有任何登记，重启后
+      仍按 mtime 阈值被清理回收。
+
+    本服务按单 worker 部署（见 Dockerfile 注释，会话锁同样是进程内对象），
+    进程内登记与清理线程天然共享同一张表。
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._active: set[Path] = set()
+
+    def create(self) -> Path:
+        """持锁创建临时文件并登记，返回其路径。"""
+        with self._guard:
+            fd, name = tempfile.mkstemp(dir=tmp_dir(), prefix="recv-", suffix=".part")
+            os.close(fd)
+            path = Path(name)
+            self._active.add(path)
+            return path
+
+    def discard(self, path: str | Path) -> None:
+        """摘除活动登记（落位 rename 之后或失败 unlink 之后）。
+
+        幂等：文件已不在表中（例如重复清理）时无副作用。
+        """
+        with self._guard:
+            self._active.discard(Path(path))
+
+    def active_count(self) -> int:
+        """当前受保护的临时文件数（供测试与运维诊断）。"""
+        with self._guard:
+            return len(self._active)
+
+    def snapshot(self) -> frozenset[Path]:
+        """当前受保护临时文件路径的快照（供测试与运维诊断）。"""
+        with self._guard:
+            return frozenset(self._active)
+
+    def sweep(self, older_than: datetime) -> int:
+        """删除早于给定时间且当前不受保护的临时文件，返回删除条数。
+
+        扫描、活动判定与删除全程持有登记锁：与 ``create``/``discard``
+        串行，清理看到的“未登记”状态不可能在 unlink 前被任何请求改成
+        “活动中”。受保护文件一律跳过（与其 mtime 无关）；只有未登记
+        （无主/进程遗留）且超时的文件才删除。
+        """
+        removed = 0
+        with self._guard:
+            for entry in tmp_dir().glob("*"):
+                if entry in self._active:
+                    # 仍在接收/拼装：请求存活即受保护，停顿多久都不删。
+                    continue
+                try:
+                    st = entry.stat()
+                except FileNotFoundError:
+                    continue
+                if not stat_module.S_ISREG(st.st_mode):
+                    continue
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+                if mtime >= older_than:
+                    continue
+                try:
+                    entry.unlink()
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+        return removed
+
+
+active_tempfiles = ActiveTempFiles()
+
+
+@contextmanager
+def receive_temp_file() -> Iterator[Path]:
+    """创建受活动期保护的接收临时文件，退出作用域时保证摘除保护。
+
+    成功路径：调用方把临时文件 rename 落位（原路径随即消失），退出时
+    只摘除登记；失败路径：调用方 unlink 临时文件，退出时同样摘除登记。
+    任何异常（含客户端断连、请求取消、提交线程抛出）都会走到 finally，
+    不会留下“永远受保护”的幽灵登记。
+    """
+    tmp = new_temp_file()
+    try:
+        yield tmp
+    finally:
+        active_tempfiles.discard(tmp)
+
+
+def sweep_old_tempfiles(older_than: datetime) -> int:
+    """删除早于给定时间且没有活动请求持有的临时文件（崩溃残留兜底）。
+
+    活动判定与删除在同一把登记锁内完成（见 :class:`ActiveTempFiles`）。
+    """
+    return active_tempfiles.sweep(older_than)
 
 
 def sweep_repair_backups(
@@ -256,7 +365,10 @@ def assemble_artifact(
             raise ValueError(f"assembled {seen} bytes, expected {total_size}")
     except Exception:
         tmp_out.unlink(missing_ok=True)
+        active_tempfiles.discard(tmp_out)
         raise
+    # 成功：路径与活动登记一并转交给调用方（complete 事务），
+    # 由其在发布或失败清理后 discard。
     return str(tmp_out), sha.hexdigest()
 
 
@@ -350,5 +462,8 @@ def copy_artifact_segment(
                 remaining -= len(block)
     except BaseException:
         tmp_out.unlink(missing_ok=True)
+        active_tempfiles.discard(tmp_out)
         raise
+    # 成功：路径与活动登记转交给调用方（copy-chunk 提交），
+    # 由其在落位或失败清理后 discard。
     return str(tmp_out)

@@ -100,18 +100,22 @@ def sweep_expired_claims(now: storage.datetime | None = None) -> int:
 
 def run_cleanup(now: storage.datetime | None = None) -> list[str]:
     """执行一轮完整清理，返回被过期的会话 id（供测试调用）。"""
+    now = now or storage.utcnow()
     storage.ensure_dirs()
     expired = expire_due_sessions(now=now)
     sweep_completed_parts()
     sweep_expired_claims(now=now)
-    storage.sweep_old_tempfiles(
-        (now or storage.utcnow()) - timedelta(hours=1)
-    )
+    one_hour_ago = now - timedelta(hours=1)
+    # tmp 接收文件按 mtime（一小时前）兜底回收；仍在接收/拼装（PUT 分片、
+    # 原位修复、copy-chunk、整文件拼装）的文件登记在 active_tempfiles 中，
+    # 活动判定与删除在同一把登记锁内原子完成，停顿再久也不会被误删；
+    # 只有进程退出遗留的无登记超时文件会在这里被回收。
+    storage.sweep_old_tempfiles(one_hour_ago)
     # 原位修复崩溃可能残留的旧分片备份（正常成功/失败路径都会立即回收）。
     # 仍需启动恢复（uploading 会话 + 数据库存在精确分片区间）的备份无论
     # 多旧都受保护，绝不删除——否则已登记区间会缺文件或原内容永久丢失。
     storage.sweep_repair_backups(
-        (now or storage.utcnow()) - timedelta(hours=1),
+        one_hour_ago,
         protected=recovery.pending_recovery_backups(),
     )
     return expired
